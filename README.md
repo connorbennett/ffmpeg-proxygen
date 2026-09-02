@@ -8,6 +8,17 @@ An Apple-Silicon-oriented command-line tool for creating H.264 QuickTime proxy f
 
 The proxy tree mirrors every source subfolder. Each output uses the same source base name with a `.mov` extension, for example `A001C001_0101AB.mov` becomes `A001C001_0101AB.mov` in the matching output subfolder.
 
+## Prebuilt Apple Silicon executable
+
+The repository includes a standalone Apple-Silicon (`arm64`) command-line build at [`dist/ffmpeg-proxygen-macos-arm64`](dist/ffmpeg-proxygen-macos-arm64). Download it, make it executable, and place it somewhere on your `PATH`:
+
+```sh
+chmod +x ffmpeg-proxygen-macos-arm64
+sudo mv ffmpeg-proxygen-macos-arm64 /usr/local/bin/ffmpeg-proxygen
+```
+
+The executable bundles the Python runtime and BRAW bridge, but it still requires FFmpeg (and, for `.braw` clips, the installed Blackmagic RAW SDK) as described below. It is ad-hoc signed, but not Developer ID-signed or notarized, so macOS may require you to approve it before its first use.
+
 ## Output characteristics
 
 - H.264 High Profile, encoded with `h264_videotoolbox`
