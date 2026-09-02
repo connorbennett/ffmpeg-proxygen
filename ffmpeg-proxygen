@@ -1,0 +1,1008 @@
+#!/usr/bin/env python3
+"""Create Apple-Silicon-accelerated H.264 QuickTime proxy files."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import mmap
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import uuid
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+from typing import Any, Sequence
+
+
+VIDEO_EXTENSIONS = {
+    ".3gp",
+    ".avi",
+    ".braw",
+    ".m2ts",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpe",
+    ".mpeg",
+    ".mpg",
+    ".mxf",
+    ".mts",
+    ".ts",
+    ".webm",
+}
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+BRAW_BRIDGE_SOURCE = SCRIPT_DIRECTORY / "braw-sdk-bridge.cpp"
+BRAW_BRIDGE_DEFAULT = SCRIPT_DIRECTORY / "braw-sdk-bridge"
+BRAW_SDK_LIBRARIES_DEFAULT = Path(
+    "/Applications/Blackmagic RAW/Blackmagic RAW SDK/Mac/Libraries"
+)
+
+
+class ProxygenError(Exception):
+    """An expected, user-facing proxy generation error."""
+
+
+@dataclass(frozen=True)
+class Job:
+    source: Path
+    destination: Path
+
+
+@dataclass(frozen=True)
+class Result:
+    job: Job
+    status: str
+    detail: str = ""
+
+
+def error(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+
+
+def info(message: str) -> None:
+    print(message, flush=True)
+
+
+def command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def has_h264_videotoolbox(ffmpeg_bin: str) -> bool:
+    """Check the encoder up front so every job does not fail the same way."""
+    try:
+        output = run_checked([ffmpeg_bin, "-hide_banner", "-encoders"])
+    except ProxygenError:
+        return False
+    return "h264_videotoolbox" in output
+
+
+def run_checked(command: Sequence[str]) -> str:
+    try:
+        process = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        raise ProxygenError(f"could not run {command[0]!r}: {exc}") from exc
+    if process.returncode != 0:
+        stderr = process.stderr.strip()
+        raise ProxygenError(stderr or f"{command[0]} exited with status {process.returncode}")
+    return process.stdout
+
+
+def braw_sdk_libraries(args: argparse.Namespace) -> Path:
+    configured = args.braw_sdk_libraries or os.environ.get("BRAW_SDK_LIBRARIES")
+    return Path(configured).expanduser() if configured else BRAW_SDK_LIBRARIES_DEFAULT
+
+
+def prepare_braw_support(args: argparse.Namespace) -> Path:
+    """Build the small native SDK bridge when no current executable is available."""
+    if sys.platform != "darwin":
+        raise ProxygenError("Blackmagic RAW proxy generation is supported only on macOS")
+
+    libraries = braw_sdk_libraries(args)
+    framework = libraries / "BlackmagicRawAPI.framework"
+    include_directory = libraries.parent / "Include"
+    dispatch_source = include_directory / "BlackmagicRawAPIDispatch.cpp"
+    if not framework.is_dir() or not include_directory.is_dir() or not dispatch_source.is_file():
+        raise ProxygenError(
+            "Blackmagic RAW SDK was not found. Install Blackmagic RAW, or pass "
+            "--braw-sdk-libraries /path/to/Mac/Libraries"
+        )
+
+    bridge = Path(args.braw_bridge).expanduser()
+    needs_build = not bridge.is_file() or (
+        BRAW_BRIDGE_SOURCE.is_file() and BRAW_BRIDGE_SOURCE.stat().st_mtime > bridge.stat().st_mtime
+    )
+    if needs_build:
+        if not BRAW_BRIDGE_SOURCE.is_file():
+            raise ProxygenError(f"BRAW bridge source is missing: {BRAW_BRIDGE_SOURCE}")
+        if not command_exists("xcrun"):
+            raise ProxygenError("Xcode Command Line Tools are required to build the BRAW bridge")
+        bridge.parent.mkdir(parents=True, exist_ok=True)
+        build_command = [
+            "xcrun",
+            "clang++",
+            "-std=c++17",
+            "-O3",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(include_directory),
+            str(BRAW_BRIDGE_SOURCE),
+            str(dispatch_source),
+            "-framework",
+            "CoreFoundation",
+            "-o",
+            str(bridge),
+        ]
+        try:
+            run_checked(build_command)
+        except ProxygenError as exc:
+            raise ProxygenError(f"could not build the Blackmagic RAW bridge:\n{exc}") from exc
+        bridge.chmod(0o755)
+
+    args.braw_bridge = str(bridge.resolve())
+    args.braw_sdk_libraries = str(libraries.resolve())
+    return bridge
+
+
+def braw_bridge_command(args: argparse.Namespace, mode: str, source: Path, *extra: str) -> list[str]:
+    return [
+        args.braw_bridge,
+        "--sdk-libraries",
+        args.braw_sdk_libraries,
+        mode,
+        str(source),
+        *extra,
+    ]
+
+
+def braw_probe(source: Path, args: argparse.Namespace) -> dict[str, Any]:
+    extra = () if args.proxy_height is None else ("--target-height", str(args.proxy_height))
+    output = run_checked(braw_bridge_command(args, "probe", source, *extra))
+    try:
+        probe = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ProxygenError(f"Blackmagic RAW bridge returned invalid JSON: {exc}") from exc
+    required = ("decode_width", "decode_height", "decode_scale", "frame_rate")
+    if any(not probe.get(key) for key in required):
+        raise ProxygenError("Blackmagic RAW bridge did not return complete video metadata")
+    return probe
+
+
+def braw_frame_rate(probe: dict[str, Any]) -> str:
+    try:
+        frame_rate = float(probe["frame_rate"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProxygenError("Blackmagic RAW source has no valid frame rate") from exc
+    if frame_rate <= 0:
+        raise ProxygenError("Blackmagic RAW source has no valid frame rate")
+    return str(Fraction(frame_rate).limit_denominator(1_000_000))
+
+
+def braw_audio_format(audio: dict[str, Any]) -> tuple[str, str]:
+    try:
+        bit_depth = int(audio["bit_depth"])
+        channels = int(audio["channels"])
+        sample_rate = int(audio["sample_rate"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProxygenError("Blackmagic RAW source returned incomplete audio metadata") from exc
+    if channels < 1 or sample_rate < 1:
+        raise ProxygenError("Blackmagic RAW source has invalid audio metadata")
+    formats = {
+        16: ("s16le", "pcm_s16le"),
+        24: ("s24le", "pcm_s24le"),
+        32: ("s32le", "pcm_s32le"),
+    }
+    try:
+        return formats[bit_depth]
+    except KeyError as exc:
+        raise ProxygenError(f"unsupported Blackmagic RAW PCM bit depth: {bit_depth}") from exc
+
+
+def ffprobe(source: Path, ffprobe_bin: str) -> dict[str, Any]:
+    output = run_checked(
+        [
+            ffprobe_bin,
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags:stream=index,codec_type,codec_name,channels,channel_layout,avg_frame_rate,r_frame_rate,"
+            "color_range,color_space,color_transfer,color_primaries:stream_tags",
+            "-of",
+            "json",
+            str(source),
+        ]
+    )
+    try:
+        return json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise ProxygenError(f"ffprobe returned invalid JSON: {exc}") from exc
+
+
+def stream_with_type(probe: dict[str, Any], stream_type: str) -> dict[str, Any] | None:
+    return next(
+        (stream for stream in probe.get("streams", []) if stream.get("codec_type") == stream_type),
+        None,
+    )
+
+
+def source_timecode(probe: dict[str, Any]) -> str | None:
+    """Return the first source timecode tag, wherever the camera/container stored it."""
+    locations: list[dict[str, Any]] = [probe.get("format", {}).get("tags", {})]
+    locations.extend(stream.get("tags", {}) for stream in probe.get("streams", []))
+    for tags in locations:
+        timecode = tags.get("timecode")
+        if timecode:
+            return str(timecode)
+    return None
+
+
+def needs_discrete_audio_layout(probe: dict[str, Any], *, is_braw: bool) -> bool:
+    """Identify multichannel audio whose source has no speaker-layout declaration.
+
+    FFmpeg's MOV muxer otherwise labels six discrete source channels as 5.1.
+    Premiere considers that a different audio configuration when attaching a proxy.
+    """
+    if is_braw:
+        audio = probe.get("audio")
+        if not isinstance(audio, dict):
+            return False
+        try:
+            return int(audio.get("channels", 0)) > 2
+        except (TypeError, ValueError):
+            return False
+
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") != "audio":
+            continue
+        try:
+            channels = int(stream.get("channels", 0))
+        except (TypeError, ValueError):
+            continue
+        layout = str(stream.get("channel_layout", "")).lower()
+        if channels > 2 and layout in {"", "unknown", "unspecified"}:
+            return True
+    return False
+
+
+def mov_moov_atom(path: Path) -> tuple[int, int]:
+    """Return the byte range of a top-level QuickTime `moov` atom."""
+    file_size = path.stat().st_size
+    position = 0
+    with path.open("rb") as file:
+        while position + 8 <= file_size:
+            file.seek(position)
+            header = file.read(8)
+            atom_size = int.from_bytes(header[:4], "big")
+            atom_type = header[4:]
+            header_size = 8
+            if atom_size == 1:
+                extended_size = file.read(8)
+                if len(extended_size) != 8:
+                    break
+                atom_size = int.from_bytes(extended_size, "big")
+                header_size = 16
+            elif atom_size == 0:
+                atom_size = file_size - position
+            if atom_size < header_size or position + atom_size > file_size:
+                break
+            if atom_type == b"moov":
+                return position, atom_size
+            position += atom_size
+    raise ProxygenError(f"could not locate a valid QuickTime moov atom in {path}")
+
+
+def neutralize_generated_mov_channel_layout(path: Path) -> int:
+    """Turn generated `chan` atoms into inert `free` atoms without rewriting media.
+
+    This preserves offsets and avoids copying the multi-gigabyte movie. It is used
+    only when the source has multichannel audio with no declared speaker layout.
+    """
+    moov_offset, moov_size = mov_moov_atom(path)
+    page_size = mmap.ALLOCATIONGRANULARITY
+    map_offset = moov_offset - (moov_offset % page_size)
+    relative_moov_offset = moov_offset - map_offset
+    with path.open("r+b") as file:
+        mapped = mmap.mmap(
+            file.fileno(),
+            relative_moov_offset + moov_size,
+            access=mmap.ACCESS_WRITE,
+            offset=map_offset,
+        )
+        try:
+            start = relative_moov_offset
+            end = relative_moov_offset + moov_size
+            changed = 0
+            position = start
+            while True:
+                position = mapped.find(b"chan", position, end)
+                if position == -1:
+                    break
+                atom_offset = position - 4
+                atom_size = (
+                    int.from_bytes(mapped[atom_offset:position], "big") if atom_offset >= start else 0
+                )
+                if 8 <= atom_size <= end - atom_offset:
+                    mapped[position : position + 4] = b"free"
+                    changed += 1
+                position += 4
+            if changed:
+                mapped.flush()
+            return changed
+        finally:
+            mapped.close()
+
+
+def source_colour_options(video_stream: dict[str, Any] | None) -> list[str]:
+    """Preserve valid colour signalling when ffprobe exposes it."""
+    if not video_stream:
+        return []
+
+    mapping = {
+        "color_range": "-color_range",
+        "color_space": "-colorspace",
+        "color_transfer": "-color_trc",
+        "color_primaries": "-color_primaries",
+    }
+    options: list[str] = []
+    for source_key, ffmpeg_option in mapping.items():
+        value = video_stream.get(source_key)
+        if value and value not in {"unknown", "unspecified", "reserved"}:
+            options.extend([ffmpeg_option, str(value)])
+    return options
+
+
+def video_filter(*, proxy_height: int | None, hardware_frames: bool) -> str | None:
+    """Return the smallest filter graph needed for the selected output size."""
+    if proxy_height is not None:
+        if hardware_frames:
+            return f"scale_vt=-2:{proxy_height}"
+        return f"scale=-2:{proxy_height}:flags=lanczos,format=nv12"
+    # Software-decoded frames still need a VideoToolbox-compatible pixel format.
+    return None if hardware_frames else "format=nv12"
+
+
+def build_ffmpeg_command(
+    *,
+    source: Path,
+    temporary_destination: Path,
+    probe: dict[str, Any],
+    ffmpeg_bin: str,
+    ffmpeg_threads: int,
+    hardware_decode: bool,
+    proxy_height: int | None,
+) -> list[str]:
+    """Build a command with no output frame-rate option, preserving source timing."""
+    video_stream = stream_with_type(probe, "video")
+    if video_stream is None:
+        raise ProxygenError("no video stream found")
+
+    command = [ffmpeg_bin, "-hide_banner", "-nostdin", "-y"]
+    if ffmpeg_threads >= 0:
+        command.extend(["-threads", str(ffmpeg_threads)])
+    if hardware_decode:
+        # Keeps decode, scale, and encode in VideoToolbox when the source codec permits it.
+        command.extend(
+            ["-hwaccel", "videotoolbox", "-hwaccel_output_format", "videotoolbox_vld"]
+        )
+    command.extend(["-i", str(source)])
+
+    command.extend(
+        [
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map_metadata",
+            "0",
+            "-map_metadata:s:v:0",
+            "0:s:v:0",
+            "-map_chapters",
+            "0",
+            "-c:v",
+            "h264_videotoolbox",
+            "-profile:v",
+            "high",
+            "-b:v",
+            "4M",
+            "-maxrate:v",
+            "4M",
+            "-bufsize:v",
+            "8M",
+            # Do not specify -r: source timestamps and frame rate are retained.
+            "-fps_mode:v",
+            "passthrough",
+            "-c:a",
+            "copy",
+        ]
+    )
+
+    filter_graph = video_filter(proxy_height=proxy_height, hardware_frames=hardware_decode)
+    if filter_graph:
+        command.extend(["-vf", filter_graph])
+
+    command.extend(source_colour_options(video_stream))
+
+    timecode = source_timecode(probe)
+    if timecode:
+        # Creates a QuickTime timecode track rather than merely retaining a text tag.
+        command.extend(["-timecode", timecode])
+
+    command.extend(
+        [
+            "-movflags",
+            "+use_metadata_tags",
+            "-f",
+            "mov",
+            str(temporary_destination),
+        ]
+    )
+    return command
+
+
+def braw_metadata_options(source: Path, probe: dict[str, Any]) -> list[str]:
+    """Write the useful BRAW camera metadata into MOV's metadata-tag namespace."""
+    metadata = probe.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    tags: dict[str, str] = {"title": source.stem}
+    tag_mapping = {
+        "manufacturer": "com.apple.quicktime.make",
+        "camera_type": "com.apple.quicktime.model",
+        "lens_type": "com.apple.proapps.camera.lens_model",
+        "camera_id": "com.apple.proxygen.braw.camera_id",
+        "firmware_version": "com.apple.proxygen.braw.firmware_version",
+        "production_name": "com.apple.proxygen.braw.production_name",
+        "clip_number": "com.apple.proxygen.braw.clip_number",
+        "reel_name": "com.apple.proxygen.braw.reel_name",
+        "scene": "com.apple.proxygen.braw.scene",
+        "take": "com.apple.proxygen.braw.take",
+        "camera_number": "com.apple.proxygen.braw.camera_number",
+        "camera_operator": "com.apple.proxygen.braw.camera_operator",
+        "date_recorded": "date",
+        "viewing_gamma": "com.apple.proxygen.braw.viewing_gamma",
+        "viewing_gamut": "com.apple.proxygen.braw.viewing_gamut",
+    }
+    for source_key, output_key in tag_mapping.items():
+        value = metadata.get(source_key)
+        if value not in (None, ""):
+            tags[output_key] = str(value)
+    camera_type = probe.get("camera_type")
+    if camera_type:
+        tags.setdefault("com.apple.quicktime.model", str(camera_type))
+
+    options: list[str] = []
+    for key, value in tags.items():
+        options.extend(["-metadata", f"{key}={value}"])
+    return options
+
+
+def build_braw_ffmpeg_command(
+    *,
+    source: Path,
+    temporary_destination: Path,
+    probe: dict[str, Any],
+    video_pipe_fd: int,
+    audio_pipe_fd: int | None,
+    ffmpeg_bin: str,
+    ffmpeg_threads: int,
+    proxy_height: int | None,
+) -> list[str]:
+    try:
+        width = int(probe["decode_width"])
+        height = int(probe["decode_height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProxygenError("Blackmagic RAW source has invalid decode dimensions") from exc
+    if width < 1 or height < 1:
+        raise ProxygenError("Blackmagic RAW source has invalid decode dimensions")
+
+    command = [ffmpeg_bin, "-hide_banner", "-nostdin", "-y"]
+    if ffmpeg_threads >= 0:
+        command.extend(["-threads", str(ffmpeg_threads)])
+    command.extend(
+        [
+            "-f",
+            "rawvideo",
+            "-pixel_format",
+            "rgba",
+            "-video_size",
+            f"{width}x{height}",
+            "-framerate",
+            braw_frame_rate(probe),
+            "-i",
+            f"pipe:{video_pipe_fd}",
+        ]
+    )
+
+    audio = probe.get("audio")
+    if audio is not None:
+        if not isinstance(audio, dict) or audio_pipe_fd is None:
+            raise ProxygenError("Blackmagic RAW source returned invalid audio metadata")
+        input_format, _ = braw_audio_format(audio)
+        command.extend(
+            [
+                "-f",
+                input_format,
+                "-ar",
+                str(audio["sample_rate"]),
+                "-ac",
+                str(audio["channels"]),
+                "-i",
+                f"pipe:{audio_pipe_fd}",
+            ]
+        )
+
+    command.extend(
+        [
+            "-map",
+            "0:v:0",
+        ]
+    )
+    if audio is not None:
+        _, output_codec = braw_audio_format(audio)
+        command.extend(["-map", "1:a:0", "-c:a", output_codec])
+    command.extend(
+        [
+            "-c:v",
+            "h264_videotoolbox",
+            "-profile:v",
+            "high",
+            "-b:v",
+            "4M",
+            "-maxrate:v",
+            "4M",
+            "-bufsize:v",
+            "8M",
+            "-fps_mode:v",
+            "passthrough",
+            "-vf",
+            video_filter(proxy_height=proxy_height, hardware_frames=False) or "format=nv12",
+            "-shortest",
+        ]
+    )
+    command.extend(braw_metadata_options(source, probe))
+    timecode = probe.get("timecode")
+    if timecode:
+        command.extend(["-timecode", str(timecode)])
+    command.extend(
+        [
+            "-movflags",
+            "+use_metadata_tags",
+            "-f",
+            "mov",
+            str(temporary_destination),
+        ]
+    )
+    return command
+
+
+def compact_ffmpeg_error(stderr: str) -> str:
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    useful = [
+        line
+        for line in lines
+        if not line.startswith(("ffmpeg version", "built with", "configuration:", "libav"))
+    ]
+    return "\n".join(useful[-12:]) or stderr.strip()
+
+
+def run_ffmpeg(command: list[str]) -> tuple[bool, str]:
+    process = subprocess.run(
+        command,
+        check=False,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    return process.returncode == 0, compact_ffmpeg_error(process.stderr)
+
+
+def is_readable_media_file(path: Path, ffprobe_bin: str) -> bool:
+    """Recognise an interrupted output without trusting only its .mov extension."""
+    try:
+        run_checked(
+            [ffprobe_bin, "-v", "error", "-show_entries", "format=format_name", "-of", "json", str(path)]
+        )
+    except ProxygenError:
+        return False
+    return True
+
+
+def process_error(process: subprocess.Popen[str], label: str) -> str:
+    _, stderr = process.communicate()
+    if process.returncode == 0:
+        return ""
+    return f"{label} exited with status {process.returncode}:\n{compact_ffmpeg_error(stderr)}"
+
+
+def stop_process(process: subprocess.Popen[str] | None) -> None:
+    if process is not None and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+
+def run_braw_ffmpeg(
+    *,
+    source: Path,
+    temporary_destination: Path,
+    probe: dict[str, Any],
+    args: argparse.Namespace,
+) -> tuple[bool, str]:
+    """Stream BRAW SDK video and audio pipes to FFmpeg without intermediate media."""
+    video_read_fd, video_write_fd = os.pipe()
+    audio_read_fd: int | None = None
+    audio_write_fd: int | None = None
+    if probe.get("audio") is not None:
+        audio_read_fd, audio_write_fd = os.pipe()
+
+    ffmpeg_process: subprocess.Popen[str] | None = None
+    video_process: subprocess.Popen[str] | None = None
+    audio_process: subprocess.Popen[str] | None = None
+    try:
+        pass_fds = (video_read_fd,) if audio_read_fd is None else (video_read_fd, audio_read_fd)
+        ffmpeg_command = build_braw_ffmpeg_command(
+            source=source,
+            temporary_destination=temporary_destination,
+            probe=probe,
+            video_pipe_fd=video_read_fd,
+            audio_pipe_fd=audio_read_fd,
+            ffmpeg_bin=args.ffmpeg,
+            ffmpeg_threads=args.ffmpeg_threads,
+            proxy_height=args.proxy_height,
+        )
+        ffmpeg_process = subprocess.Popen(
+            ffmpeg_command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            pass_fds=pass_fds,
+        )
+        os.close(video_read_fd)
+        video_read_fd = -1
+        if audio_read_fd is not None:
+            os.close(audio_read_fd)
+            audio_read_fd = None
+
+        video_process = subprocess.Popen(
+            braw_bridge_command(args, "video", source, str(probe["decode_scale"])),
+            stdin=subprocess.DEVNULL,
+            stdout=video_write_fd,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        os.close(video_write_fd)
+        video_write_fd = -1
+        if audio_write_fd is not None:
+            audio_process = subprocess.Popen(
+                braw_bridge_command(args, "audio", source),
+                stdin=subprocess.DEVNULL,
+                stdout=audio_write_fd,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.close(audio_write_fd)
+            audio_write_fd = None
+
+        _, ffmpeg_stderr = ffmpeg_process.communicate()
+        video_error = process_error(video_process, "BRAW video bridge")
+        audio_error = process_error(audio_process, "BRAW audio bridge") if audio_process else ""
+        if ffmpeg_process.returncode == 0 and not video_error and not audio_error:
+            return True, ""
+        details = [compact_ffmpeg_error(ffmpeg_stderr)]
+        if video_error:
+            details.append(video_error)
+        if audio_error:
+            details.append(audio_error)
+        return False, "\n\n".join(detail for detail in details if detail)
+    except (OSError, ProxygenError) as exc:
+        return False, str(exc)
+    finally:
+        for fd in (video_read_fd, video_write_fd, audio_read_fd, audio_write_fd):
+            if fd is not None and fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        stop_process(video_process)
+        stop_process(audio_process)
+        stop_process(ffmpeg_process)
+
+
+def proxy_one(
+    job: Job,
+    *,
+    args: argparse.Namespace,
+    print_lock: threading.Lock,
+) -> Result:
+    destination = job.destination
+    temporary: Path | None = None
+    if destination.exists():
+        if not destination.is_file():
+            return Result(job, "failed", f"destination exists but is not a file: {destination}")
+        retry_incomplete_braw = (
+            job.source.suffix.lower() == ".braw"
+            and not args.overwrite
+            and not is_readable_media_file(destination, args.ffprobe)
+        )
+        if not args.overwrite and not retry_incomplete_braw:
+            with print_lock:
+                info(f"SKIP  {job.source} (destination already exists)")
+            return Result(job, "skipped")
+        if retry_incomplete_braw:
+            with print_lock:
+                info(f"RETRY {job.source} (existing BRAW proxy is incomplete or unreadable)")
+
+    try:
+        temporary = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex}.part.mov")
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+
+        with print_lock:
+            info(f"START {job.source} -> {destination}")
+
+        if job.source.suffix.lower() == ".braw":
+            probe = braw_probe(job.source, args)
+            succeeded, braw_error = run_braw_ffmpeg(
+                source=job.source,
+                temporary_destination=temporary,
+                probe=probe,
+                args=args,
+            )
+            if not succeeded:
+                temporary.unlink(missing_ok=True)
+                return Result(job, "failed", braw_error)
+            chan_atoms = 0
+            if needs_discrete_audio_layout(probe, is_braw=True):
+                chan_atoms = neutralize_generated_mov_channel_layout(temporary)
+            os.replace(temporary, destination)
+            with print_lock:
+                if chan_atoms:
+                    info(f"AUDIO {destination} (preserved unspecified multichannel layout)")
+                info(f"DONE  {destination}")
+            return Result(job, "done")
+
+        probe = ffprobe(job.source, args.ffprobe)
+
+        hardware_command = build_ffmpeg_command(
+            source=job.source,
+            temporary_destination=temporary,
+            probe=probe,
+            ffmpeg_bin=args.ffmpeg,
+            ffmpeg_threads=args.ffmpeg_threads,
+            hardware_decode=True,
+            proxy_height=args.proxy_height,
+        )
+        succeeded, hardware_error = run_ffmpeg(hardware_command)
+        if not succeeded:
+            temporary.unlink(missing_ok=True)
+            with print_lock:
+                info(f"RETRY {job.source} (CPU decode/scale, VideoToolbox encode)")
+            cpu_command = build_ffmpeg_command(
+                source=job.source,
+                temporary_destination=temporary,
+                probe=probe,
+                ffmpeg_bin=args.ffmpeg,
+                ffmpeg_threads=args.ffmpeg_threads,
+                hardware_decode=False,
+                proxy_height=args.proxy_height,
+            )
+            succeeded, cpu_error = run_ffmpeg(cpu_command)
+            if not succeeded:
+                temporary.unlink(missing_ok=True)
+                return Result(
+                    job,
+                    "failed",
+                    "hardware path:\n"
+                    + hardware_error
+                    + "\n\nCPU fallback:\n"
+                    + cpu_error,
+                )
+
+        chan_atoms = 0
+        if needs_discrete_audio_layout(probe, is_braw=False):
+            chan_atoms = neutralize_generated_mov_channel_layout(temporary)
+        # Same-volume rename makes a completed proxy appear atomically.
+        os.replace(temporary, destination)
+        with print_lock:
+            if chan_atoms:
+                info(f"AUDIO {destination} (preserved unspecified multichannel layout)")
+            info(f"DONE  {destination}")
+        return Result(job, "done")
+    except (OSError, ProxygenError) as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        return Result(job, "failed", str(exc))
+
+
+def discover_jobs(source_root: Path, destination_root: Path) -> list[Job]:
+    sources = sorted(
+        (
+            source
+            for source in source_root.rglob("*")
+            if source.is_file() and source.suffix.lower() in VIDEO_EXTENSIONS
+        ),
+        key=lambda path: str(path).lower(),
+    )
+    jobs = [
+        Job(
+            source=source,
+            destination=(destination_root / source.relative_to(source_root)).with_suffix(".mov"),
+        )
+        for source in sources
+    ]
+
+    collisions: dict[Path, list[Path]] = {}
+    for job in jobs:
+        collisions.setdefault(job.destination, []).append(job.source)
+    duplicates = {output: inputs for output, inputs in collisions.items() if len(inputs) > 1}
+    if duplicates:
+        rendered = "\n".join(
+            f"  {output}: {', '.join(str(source) for source in inputs)}"
+            for output, inputs in sorted(duplicates.items())
+        )
+        raise ProxygenError(
+            "two or more source files would have the same .mov proxy name:\n" + rendered
+        )
+    return jobs
+
+
+def default_jobs() -> int:
+    """A practical upper bound for simultaneous VideoToolbox sessions on Apple Silicon."""
+    logical_cpus = os.cpu_count() or 4
+    return max(1, min(8, logical_cpus // 2))
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Recursively create source-resolution, 4 Mbps H.264 QuickTime proxies with "
+            "copied audio, timecode, and metadata."
+        )
+    )
+    parser.add_argument("input_folder", type=Path, help="folder containing source videos")
+    parser.add_argument("output_folder", type=Path, help="folder for the mirrored proxy tree")
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        default=default_jobs(),
+        help=f"simultaneous FFmpeg jobs (default: {default_jobs()})",
+    )
+    parser.add_argument(
+        "--ffmpeg-threads",
+        type=int,
+        default=0,
+        help="threads per FFmpeg process; 0 lets FFmpeg choose (default: 0)",
+    )
+    resolution = parser.add_mutually_exclusive_group()
+    resolution.add_argument(
+        "--1080p",
+        dest="proxy_height",
+        action="store_const",
+        const=1080,
+        help="scale proxies to 1080 pixels high, preserving aspect ratio",
+    )
+    resolution.add_argument(
+        "--720p",
+        dest="proxy_height",
+        action="store_const",
+        const=720,
+        help="scale proxies to 720 pixels high, preserving aspect ratio",
+    )
+    parser.set_defaults(proxy_height=None)
+    parser.add_argument("--overwrite", action="store_true", help="replace completed proxy files")
+    parser.add_argument("--dry-run", action="store_true", help="list jobs without transcoding")
+    parser.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg executable (default: ffmpeg)")
+    parser.add_argument("--ffprobe", default="ffprobe", help="FFprobe executable (default: ffprobe)")
+    parser.add_argument(
+        "--braw-sdk-libraries",
+        help=(
+            "BlackmagicRawAPI SDK Libraries folder; defaults to the installed macOS SDK or "
+            "BRAW_SDK_LIBRARIES"
+        ),
+    )
+    parser.add_argument(
+        "--braw-bridge",
+        default=str(BRAW_BRIDGE_DEFAULT),
+        help="path for the compiled Blackmagic RAW bridge (default: beside this script)",
+    )
+    return parser.parse_args(argv)
+
+
+def validate_arguments(args: argparse.Namespace) -> tuple[Path, Path]:
+    if args.jobs < 1:
+        raise ProxygenError("--jobs must be at least 1")
+    if args.ffmpeg_threads < 0:
+        raise ProxygenError("--ffmpeg-threads must be 0 or greater")
+    if not command_exists(args.ffmpeg):
+        raise ProxygenError(f"FFmpeg executable not found: {args.ffmpeg}")
+    if not command_exists(args.ffprobe):
+        raise ProxygenError(f"FFprobe executable not found: {args.ffprobe}")
+    if not has_h264_videotoolbox(args.ffmpeg):
+        raise ProxygenError(
+            "FFmpeg does not provide the h264_videotoolbox encoder; install an Apple "
+            "VideoToolbox-enabled FFmpeg build"
+        )
+
+    source_root = args.input_folder.expanduser().resolve()
+    destination_root = args.output_folder.expanduser().resolve()
+    if not source_root.is_dir():
+        raise ProxygenError(f"input folder is not a directory: {source_root}")
+    if source_root == destination_root:
+        raise ProxygenError("input and output folders must be different")
+    try:
+        destination_root.relative_to(source_root)
+    except ValueError:
+        pass
+    else:
+        raise ProxygenError("output folder may not be inside the input folder")
+    return source_root, destination_root
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv if argv is not None else sys.argv[1:])
+    try:
+        source_root, destination_root = validate_arguments(args)
+        jobs = discover_jobs(source_root, destination_root)
+    except ProxygenError as exc:
+        error(str(exc))
+        return 2
+
+    if not jobs:
+        error(f"no supported video files found in {source_root}")
+        return 1
+
+    info(
+        f"Found {len(jobs)} source file(s); running up to {args.jobs} concurrent "
+        "VideoToolbox job(s)."
+    )
+    if args.dry_run:
+        for job in jobs:
+            info(f"PLAN  {job.source} -> {job.destination}")
+        return 0
+
+    if any(job.source.suffix.lower() == ".braw" for job in jobs):
+        try:
+            bridge = prepare_braw_support(args)
+        except ProxygenError as exc:
+            error(str(exc))
+            return 2
+        info(f"Blackmagic RAW SDK bridge ready: {bridge}")
+
+    print_lock = threading.Lock()
+    results: list[Result] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
+        futures = [
+            executor.submit(proxy_one, job, args=args, print_lock=print_lock) for job in jobs
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+
+    done = sum(result.status == "done" for result in results)
+    skipped = sum(result.status == "skipped" for result in results)
+    failed = [result for result in results if result.status == "failed"]
+    info(f"Finished: {done} created, {skipped} skipped, {len(failed)} failed.")
+    for result in failed:
+        error(f"{result.job.source}\n{result.detail}")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
